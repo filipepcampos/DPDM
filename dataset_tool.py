@@ -18,13 +18,16 @@ import re
 import sys
 import tarfile
 import zipfile
+import math
 from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
 
 import click
 import numpy as np
 import PIL.Image
+from PIL import Image
 from tqdm import tqdm
+import pandas as pd
 
 #----------------------------------------------------------------------------
 
@@ -180,6 +183,51 @@ def open_cifar10(tarball: str, *, max_images: Optional[int]):
                 break
 
     return max_idx, iterate_images()
+    
+
+#----------------------------------------------------------------------------
+
+def open_mimic(root: str, *, max_images: Optional[int]):
+    images = []
+    labels_list = []
+
+    metadata_labels = pd.read_csv(root + '/mimic-cxr-2.0.0-metadata.csv')
+    metadata_labels = metadata_labels.loc[metadata_labels['ViewPosition'] == 'PA']
+
+    chexpert_labels = pd.read_csv(root + '/mimic-cxr-2.0.0-chexpert.csv', index_col=['subject_id', 'study_id'])
+    labels = metadata_labels.merge(chexpert_labels, on="study_id", how="left") # TODO: Rethink whether outer is necessary
+    labels = labels.dropna(subset=["subject_id"])
+
+    labels['Cardiomegaly'] = labels['Cardiomegaly'].map(lambda x: 2 if x < 0 or math.isnan(x) else x)
+    labels = labels.set_index("dicom_id")
+
+    def get_path(row):
+        dicom_id = str(row.name)
+        subject = 'p' + str(int(row['subject_id'])) # todo: this is a lazy hack instead of properly changing column type
+        study = 's' + str(int(row['study_id']))
+        image_file = dicom_id + '.jpg'
+        return root + '/files/' + subject[:3] + '/' + subject + '/' + study + '/' + image_file
+
+    labels['Path'] = labels.apply(get_path, axis=1)
+    labels = labels[labels['Cardiomegaly']!=2]
+
+    max_idx = maybe_min(len(labels), max_images)
+    for idx, (dicom_id, row) in enumerate(labels.iterrows()):
+        if idx >= max_idx-1:
+            break
+        img = Image.open(row['Path']).convert('RGB')
+        img = np.array(img)
+        images.append(img)
+        labels_list.append(row['Cardiomegaly'])
+
+    def iterate_images():
+        for idx, img in enumerate(images):
+            yield dict(img=img, label=int(labels_list[idx]))
+            if idx >= max_idx-1:
+                break
+
+    return max_idx, iterate_images()
+
 
 #----------------------------------------------------------------------------
 
@@ -268,6 +316,8 @@ def open_dataset(source, *, max_images: Optional[int]):
     if os.path.isdir(source):
         if source.rstrip('/').endswith('_lmdb'):
             return open_lmdb(source, max_images=max_images)
+        elif "MIMIC" in source:
+            return open_mimic(source, max_images=max_images)
         else:
             return open_image_folder(source, max_images=max_images)
     elif os.path.isfile(source):
